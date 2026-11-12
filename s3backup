@@ -1,0 +1,594 @@
+#!/opt/bin/bash
+# Secondary copies are accepted only after SHA-256 verification.
+# Every &&/|| guard below intentionally rejects if any prerequisite fails.
+# shellcheck disable=SC2015
+set -u
+set -o pipefail
+umask 077
+VERSION=1.1.0
+PREFIX=${S3BACKUP_PREFIX:-/opt}
+PATH="$PREFIX/bin:$PREFIX/sbin:$PATH"
+export PATH
+ETC="$PREFIX/etc/s3backup"
+STATE="$PREFIX/var/lib/s3backup"
+RUN="$PREFIX/var/run/s3backup"
+CONFIG="$ETC/config.json"
+RCONF="$ETC/rclone.conf"
+MOUNTS=${S3BACKUP_MOUNTS_FILE:-/proc/mounts}
+PROC=${S3BACKUP_PROC_ROOT:-/proc}
+CHILD='' CHILD_TOKEN='' WORK='' WORKER=0 ACTIVE_STAGE='' HELD_DISK=0
+
+error() { printf 'Ошибка: %s\n' "$*" >&2; return 1; }
+need() { command -v "$1" >/dev/null 2>&1 || error "Не установлена программа $1. Запустите install.sh."; }
+now() { printf '%s\n' "${S3BACKUP_NOW:-$(date +%s)}"; }
+stamp() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+safe_path() { [[ "$1" == /* && "$1" != / && "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *$'\t'* && "$1" != *'/../'* && "$1" != */.. && "$1" != *'/./'* && "$1" != */. && "$1" != *'//'* ]]; }
+no_links() {
+  local p=$1
+  while [[ "$p" != / ]]; do [[ ! -L "$p" ]] || return 1; p=${p%/*}; [[ -n "$p" ]] || p=/; done
+}
+directory_empty() {
+  local entry
+  # An unreadable directory is unknown, not empty. In particular a failed find
+  # must not authorize taking ownership of somebody else's backup directory.
+  entry=$(find "$1" -mindepth 1 -maxdepth 1 -print -quit) || return 1
+  [[ -z "$entry" ]]
+}
+init_dirs() {
+  safe_path "$PREFIX" && no_links "$ETC" && no_links "$STATE" && no_links "$RUN" || { error 'Небезопасный путь установки.'; return 1; }
+  mkdir -p "$ETC" "$STATE" "$RUN" || return 1
+  chmod 700 "$ETC" "$STATE" "$RUN"
+}
+private_mode() {
+  local p=$1 mode=$2 actual owner
+  [[ ! -L "$p" ]] && chmod "$mode" "$p" || return 1
+  actual=$(stat -c %a "$p") && owner=$(stat -c %u "$p") || return 1
+  [[ "$actual" == "$mode" && "$owner" == "$(id -u)" ]] || { error 'Файловая система не обеспечивает закрытые права доступа. Выберите другой раздел.'; return 1; }
+}
+log() {
+  local line
+  line="$(stamp) $*"
+  # Only our fixed messages reach logs; rclone's responses can contain credentials.
+  if [[ -f "$STATE/activity.log" ]] && [[ $(wc -c < "$STATE/activity.log") -gt 262144 ]]; then mv -f "$STATE/activity.log" "$STATE/activity.log.1"; fi
+  printf '%s\n' "$line" >> "$STATE/activity.log"
+  printf '%s\n' "$line"
+  if command -v logger >/dev/null 2>&1; then logger -t s3backup -- "$*" 2>/dev/null || :; fi
+}
+json_state() {
+  local outcome=$1
+  jq -n --arg result "$outcome" --argjson at "$(now)" '{result:$result,at:$at}' > "$STATE/result.json.tmp" && mv -f "$STATE/result.json.tmp" "$STATE/result.json"
+}
+lock_run() { exec 9> "$RUN/run.lock"; flock -n 9; }
+lock_control() { exec 8> "$RUN/control.lock"; flock -n 8 || error 'Другая команда настройки уже работает.'; }
+ini_value() {
+  # Parse just one nonsecret field in our section; duplicate values are ambiguous.
+  awk -v wanted="$1" '
+    /^[[:space:]]*\[/ {section=$0; gsub(/[[:space:]]/,"",section); active=(section=="[s3backup]"); next}
+    active && /^[[:space:]]*[^#;][^=]*=/ {
+      key=$0; sub(/=.*/,"",key); gsub(/^[[:space:]]+|[[:space:]]+$/,"",key)
+      if(key==wanted) {value=$0; sub(/^[^=]*=/,"",value); gsub(/^[[:space:]]+|[[:space:]]+$/,"",value); count++}
+    }
+    END {if(count!=1) exit 1; print value}
+  ' "$RCONF"
+}
+
+load_config() {
+  local key value pattern LC_ALL=C
+  [[ -f "$CONFIG" && ! -L "$CONFIG" && -f "$RCONF" && ! -L "$RCONF" ]] || { error 'Сначала выполните s3backup configure.'; return 1; }
+  # Entware jq can be built without ONIGURUMA. Keep JSON type checks here,
+  # but use Bash ERE for string validation, after rejecting control characters.
+  jq -e '
+    def integer: type == "number" and floor == .;
+    def text: if type=="string" then explode|all(.>=32 and .!=127) else false end;
+    .version == 1 and
+    all(.endpoint,.region,.bucket,.prefix,.backup_dir,.mount_point,.mount_uuid,.time,.timezone; text) and
+    (.path_style|type=="boolean") and
+    (.interval_days|integer and .>=1 and .<=365) and
+    (.retention_days|integer and .>=1 and .<=3650) and
+    (.bandwidth_mib|integer and .>=0 and .<=1000) and
+    (.reserve_mib|integer and .>=1 and .<=1048576)
+  ' "$CONFIG" >/dev/null 2>&1 || { error 'Некорректная конфигурация.'; return 1; }
+  for key in endpoint region bucket prefix mount_uuid time timezone; do
+    value=$(jq -r --arg key "$key" '.[$key]' "$CONFIG") || return 1
+    case "$key" in
+      endpoint) pattern='^https://[^/[:space:]@]+(:[0-9]+)?(/[^[:space:]]*)?$';;
+      region) pattern='^[A-Za-z0-9_-]+$';;
+      bucket) pattern='^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$';;
+      prefix) pattern='^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$';;
+      mount_uuid) pattern='^[A-Za-z0-9-]+$';;
+      time) pattern='^([01][0-9]|2[0-3]):[0-5][0-9]$';;
+      timezone) pattern='^[A-Za-z]{3,12}[+-]?[0-9]{1,2}(:[0-5][0-9])?$';;
+    esac
+    [[ "$value" =~ $pattern ]] || { error "Некорректное поле конфигурации: $key."; return 1; }
+  done
+  # JSON and credentials are two files. A power loss between their replacements
+  # must fail closed, never read a new source under the old retention identity.
+  local ini_endpoint ini_region ini_style ini_type ini_provider
+  ini_endpoint=$(ini_value endpoint) && ini_region=$(ini_value region) && ini_style=$(ini_value force_path_style) && ini_type=$(ini_value type) && ini_provider=$(ini_value provider) || { error 'Неполная или неоднозначная конфигурация rclone; повторите мастер.'; return 1; }
+  [[ "$ini_endpoint" == "$(jq -r .endpoint "$CONFIG")" && "$ini_region" == "$(jq -r .region "$CONFIG")" && "$ini_style" == "$(jq -r .path_style "$CONFIG")" && "$ini_type" == s3 && "$ini_provider" == Other ]] || { error 'Параметры JSON и rclone различаются; повторите мастер. S3 не запрашивался.'; return 1; }
+  BACKUP=$(jq -r .backup_dir "$CONFIG")
+  MP=$(jq -r .mount_point "$CONFIG")
+  UUID=$(jq -r .mount_uuid "$CONFIG")
+  BUCKET=$(jq -r .bucket "$CONFIG")
+  REMOTE_PREFIX=$(jq -r .prefix "$CONFIG")
+  RETENTION=$(jq -r .retention_days "$CONFIG")
+  BANDWIDTH=$(jq -r .bandwidth_mib "$CONFIG")
+  RESERVE=$(jq -r .reserve_mib "$CONFIG")
+  safe_path "$BACKUP" && safe_path "$MP" && [[ "$BACKUP" == "$MP/"* ]] || { error 'Каталог копий должен находиться внутри выбранного диска.'; return 1; }
+  no_links "$BACKUP" || { error 'В пути к копиям обнаружена символическая ссылка.'; return 1; }
+  private_mode "$CONFIG" 600 && private_mode "$RCONF" 600 || return 1
+}
+mount_record() {
+  awk -v p="$1" '
+    {m=$2; gsub(/\\040/, " ",m); gsub(/\\134/,"\\",m);
+     if ((m=="/" || p==m || index(p,m"/")==1) && length(m)>n) {n=length(m); out=$1 "\t" m "\t" $3}}
+    END {if(n) print out; else exit 1}' "$MOUNTS"
+}
+disk_identity() {
+  local rec src point fs optrec optsrc optpoint optfs disk_uuid opt_uuid
+  rec=$(mount_record "$MP") || { error 'Диск не смонтирован.'; return 1; }
+  IFS=$'\t' read -r src point fs <<< "$rec"
+  [[ "$point" == "$MP" && "$point" != / ]] || { error 'Точка подключения HDD отсутствует.'; return 1; }
+  # Keenetic's native NTFS driver reports tntfs; effective permissions are still
+  # checked by private_mode, independently of this filesystem allowlist.
+  case "$fs" in ext2|ext3|ext4|xfs|btrfs|ntfs|ntfs3|tntfs|fuseblk|exfat) ;; *) error 'Нужен внешний диск с обычной файловой системой.'; return 1;; esac
+  disk_uuid=$(blkid -s UUID -o value "$src" 2>/dev/null) || { error 'Не удалось определить UUID диска.'; return 1; }
+  [[ -n "$disk_uuid" && "$disk_uuid" == "$UUID" ]] || { error 'Подключён другой диск: UUID не совпадает.'; return 1; }
+  optrec=$(mount_record "$PREFIX") || { error 'Не удалось определить носитель Entware.'; return 1; }
+  # shellcheck disable=SC2034
+  IFS=$'\t' read -r optsrc optpoint optfs <<< "$optrec"
+  opt_uuid=$(blkid -s UUID -o value "$optsrc" 2>/dev/null) || { error 'Не удалось определить UUID носителя Entware.'; return 1; }
+  [[ -n "$opt_uuid" && "$opt_uuid" != "$disk_uuid" && "$optsrc" != "$src" ]] || { error 'Архивы должны храниться на отдельном от Entware диске.'; return 1; }
+  # A nested mount must not redirect the backup directory onto a different disk.
+  rec=$(mount_record "$BACKUP") || return 1
+  IFS=$'\t' read -r src point fs <<< "$rec"
+  [[ "$point" == "$MP" ]] || { error 'Внутри каталога копий обнаружено другое монтирование.'; return 1; }
+  no_links "$BACKUP" && no_links "$MP" || { error 'Символическая ссылка вместо диска/каталога.'; return 1; }
+}
+disk_guard() {
+  disk_identity || return 1
+  # Keep the on-disk v1 marker for existing HDD histories created by the former
+  # command name. Runtime configuration and credentials use only s3backup paths.
+  [[ -d "$BACKUP" && -w "$BACKUP" && -f "$BACKUP/.tkbackup-owner" && ! -L "$BACKUP/.tkbackup-owner" ]] || { error 'Каталог HDD не подготовлен мастером.'; return 1; }
+  [[ $(cat "$BACKUP/.tkbackup-owner") == tkbackup-v1 ]] || { error 'Неверная метка каталога копий.'; return 1; }
+  no_links "$BACKUP/snapshots" && no_links "$BACKUP/.staging" || { error 'Символическая ссылка в служебном каталоге HDD.'; return 1; }
+  if [[ "$HELD_DISK" == 1 ]]; then private_mode . 700 || return 1
+  else private_mode "$BACKUP" 700 || return 1; fi
+}
+origin_guard() {
+  local expected actual
+  expected=$(jq -cS '{endpoint,bucket,prefix}' "$CONFIG") || return 1
+  if [[ -e ./.origin.json || -L ./.origin.json ]]; then
+    [[ -f ./.origin.json && ! -L ./.origin.json ]] || return 1
+    actual=$(jq -cS . ./.origin.json) || return 1
+    [[ "$actual" == "$expected" ]] || { error 'Этот каталог содержит копии другого S3. Выберите отдельный каталог.'; return 1; }
+  else
+    printf '%s\n' "$expected" > ./.origin.json.tmp && mv ./.origin.json.tmp ./.origin.json || return 1
+  fi
+  private_mode ./.origin.json 600
+}
+cleanup_partials() {
+  local dir name
+  for dir in ./.staging/*; do
+    [[ -e "$dir" || -L "$dir" ]] || continue
+    name=${dir##*/}
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.[A-Za-z0-9]{6}$ && -d "$dir" && ! -L "$dir" && -f "$dir/.partial-owner" && ! -L "$dir/.partial-owner" ]] || { error 'Неизвестные файлы в .staging; требуется ручная проверка.'; return 1; }
+    [[ $(cat "$dir/.partial-owner") == tkbackup-v1 ]] || return 1
+    disk_guard || return 1
+    rm -rf -- "$dir" || return 1
+  done
+}
+process_token() {
+  local data rest boot
+  local fields=()
+  [[ "$1" =~ ^[0-9]+$ && -r "$PROC/$1/stat" ]] || return 1
+  data=$(cat "$PROC/$1/stat") || return 1
+  rest=${data##*) }
+  read -r -a fields <<< "$rest"
+  [[ ${#fields[@]} -ge 20 ]] || return 1
+  [[ "${fields[0]}" != Z && "${fields[0]}" != X ]] || return 1
+  boot=$(cat "$PROC/sys/kernel/random/boot_id") || return 1
+  [[ -n "$boot" ]] || return 1
+  printf '%s:%s\n' "$boot" "${fields[19]}"
+}
+same_process() { [[ -n "$2" && $(process_token "$1" 2>/dev/null) == "$2" ]] && kill -0 "$1" 2>/dev/null; }
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM HUP
+  if [[ -n "$CHILD" ]] && same_process "$CHILD" "$CHILD_TOKEN"; then kill -TERM "$CHILD" 2>/dev/null || :; wait "$CHILD" 2>/dev/null || :; fi
+  # All HDD writes are relative to the held cwd on that filesystem. Unplugging
+  # the disk can cause I/O errors but cannot redirect these writes into rootfs.
+  if [[ "$ACTIVE_STAGE" == ./.staging/* && -d "$ACTIVE_STAGE" && ! -L "$ACTIVE_STAGE" ]]; then rm -rf -- "$ACTIVE_STAGE"; fi
+  [[ -z "$WORK" ]] || { [[ "$WORK" == "$RUN/work."* && ! -L "$WORK" ]] && rm -rf -- "$WORK"; }
+  if [[ "$WORKER" == 1 ]]; then rm -f "$RUN/process.json"; fi
+  exit "$rc"
+}
+cancelled() { log 'Копирование остановлено; готовые копии сохранены.'; json_state cancelled; exit 130; }
+rcall() {
+  local output=$1 rc
+  shift
+  local args=(--config "$RCONF" --transfers 1 --checkers 1 --buffer-size 1M --multi-thread-streams 0 --retries 2 --low-level-retries 2 --contimeout 20s --timeout 2m --log-level ERROR)
+  [[ "$BANDWIDTH" == 0 ]] || args+=(--bwlimit "${BANDWIDTH}M")
+  rclone "${args[@]}" "$@" > "$output" 2> "$WORK/rclone-error" &
+  CHILD=$!
+  CHILD_TOKEN=$(process_token "$CHILD" 2>/dev/null || :)
+  wait "$CHILD"; rc=$?
+  CHILD='' CHILD_TOKEN=''
+  [[ "$rc" == 0 ]] || { log "S3: операция не выполнена (код $rc). Проверьте сеть, ключ и параметры хранилища."; return "$rc"; }
+}
+manifest_values() {
+  local f=$1 timestamp normalized roundtrip pattern LC_ALL=C
+  jq -e --arg bucket "$BUCKET" --arg prefix "$REMOTE_PREFIX" '
+    def text: if type=="string" then explode|all(.>=32 and .!=127) else false end;
+    all(.snapshotId,.objectKey,.bucket,.sha256Ciphertext,.snapshotAt; text) and
+    (.objectKey == ($prefix+"/"+.snapshotId+".tar.zst") or .objectKey == ($prefix+"/"+.snapshotId+".tar.zst.age")) and
+    .bucket==$bucket and (.sizeBytes|type=="number" and floor==. and .>0 and .<=9007199254740991)
+  ' "$f" >/dev/null 2>&1 || { error 'Некорректный манифест снимка.'; return 1; }
+  MID=$(jq -r .snapshotId "$f")
+  KEY=$(jq -r .objectKey "$f")
+  ARCHIVE=${KEY##*/}
+  MSIZE=$(jq -r .sizeBytes "$f")
+  MSHA=$(jq -r '.sha256Ciphertext|ascii_downcase' "$f")
+  timestamp=$(jq -r .snapshotAt "$f")
+  pattern='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$'
+  [[ "$MID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ && "$MSHA" =~ ^[a-f0-9]{64}$ && "$timestamp" =~ $pattern ]] || { error 'Некорректный манифест снимка.'; return 1; }
+  normalized=$timestamp
+  if [[ "$timestamp" == *.* ]]; then normalized="${timestamp%%.*}Z"; fi
+  MTIME=$(jq -nr --arg at "$normalized" '$at|fromdateiso8601' 2>/dev/null) || { error 'Некорректная дата снимка.'; return 1; }
+  roundtrip=$(jq -nr --argjson at "$MTIME" '$at|todateiso8601' 2>/dev/null) || return 1
+  [[ "$roundtrip" == "$normalized" ]] && (( MTIME>0 && MTIME<=$(now)+300 )) || { error 'Некорректная или будущая дата снимка.'; return 1; }
+}
+verify_file() {
+  local f=$1 size sha
+  [[ -f "$f" && ! -L "$f" ]] || { error 'Архив отсутствует или является ссылкой.'; return 1; }
+  size=$(wc -c < "$f" | tr -d '[:space:]')
+  [[ "$size" == "$MSIZE" ]] || { error 'Размер архива не совпадает с манифестом.'; return 1; }
+  sha=$(sha256sum "$f") || return 1
+  [[ "${sha%% *}" == "$MSHA" ]] || { error 'SHA-256 архива не совпадает с манифестом.'; return 1; }
+}
+local_verify() {
+  local dir=$1 id=${1##*/} mark="$1/.verified.json" side
+  [[ -d "$dir" && ! -L "$dir" && -f "$mark" && ! -L "$mark" ]] || return 1
+  manifest_values "$mark" || return 1
+  [[ "$MID" == "$id" ]] || return 1
+  side="$dir/$ARCHIVE.manifest.json"
+  [[ -f "$side" && ! -L "$side" ]] || return 1
+  cmp -s "$mark" "$side" || { error 'Локальный манифест изменён.'; return 1; }
+  private_mode "$dir" 700 && private_mode "$mark" 600 && private_mode "$side" 600 && private_mode "$dir/$ARCHIVE" 600 || return 1
+  verify_file "$dir/$ARCHIVE"
+}
+list_s3() {
+  local name manifest_pattern LC_ALL=C
+  rcall "$WORK/list.json" lsjson "s3backup:$BUCKET/$REMOTE_PREFIX" --recursive --files-only || return 1
+  jq -e 'type=="array" and all(.[]; (.Path|type=="string") and (.Size|type=="number" and .>=0))' "$WORK/list.json" >/dev/null 2>&1 || { error 'S3 вернул некорректный список.'; return 1; }
+  # Exclude control characters before line-based iteration: a newline embedded
+  # in one object key must never become a second, apparently valid object name.
+  jq -r '.[].Path|select(explode|all(.>=32 and .!=127))' "$WORK/list.json" > "$WORK/paths" || return 1
+  manifest_pattern='^[A-Za-z0-9][A-Za-z0-9_-]{0,63}(\.tar\.zst(\.age)?)?\.manifest\.json$'
+  : > "$WORK/manifests"
+  while IFS= read -r name; do
+    if [[ "$name" =~ $manifest_pattern ]]; then printf '%s\n' "$name" >> "$WORK/manifests"; fi
+  done < "$WORK/paths"
+  # Manifests define the download set. Archive-only objects are deliberately
+  # ignored; a manifest pointing to a missing/broken archive still fails below.
+  return 0
+}
+fetch_snapshot() {
+  local name=$1 file target stage free expected key sha epoch id arch
+  file="$WORK/manifests-data/$name"
+  manifest_values "$file" || return 1
+  id=$MID key=$KEY sha=$MSHA epoch=$MTIME arch=$ARCHIVE expected=$MSIZE
+  target="./snapshots/$id"
+  disk_guard || return 1
+  if [[ -e "$target" || -L "$target" ]]; then
+    local_verify "$target" || { error "Локальная копия $id повреждена; перезапись запрещена."; return 1; }
+    [[ "$KEY" == "$key" && "$MSHA" == "$sha" && "$MSIZE" == "$expected" && "$MTIME" == "$epoch" ]] || { error "Снимок $id в облаке изменился; локальная копия сохранена."; return 1; }
+    return 0
+  fi
+  # Expired source objects must not be downloaded and deleted again every day.
+  # Always retain the newest available snapshot even if the source stopped.
+  if (( epoch < $(now) - RETENTION * 86400 && epoch < LATEST_REMOTE )); then return 0; fi
+  free=$(df -Pk . | awk 'END{print $4}')
+  [[ "$free" =~ ^[0-9]+$ ]] && (( free * 1024 > expected + RESERVE * 1048576 )) || { error 'Недостаточно свободного места на HDD.'; return 1; }
+  stage=$(mktemp -d "./.staging/$id.XXXXXX") || return 1
+  ACTIVE_STAGE=$stage
+  printf 'tkbackup-v1\n' > "$stage/.partial-owner" || return 1
+  rcall "$WORK/output" copyto "s3backup:$BUCKET/$key" "$stage/$arch" || return 1
+  verify_file "$stage/$arch" || return 1
+  cp "$file" "$stage/$arch.manifest.json" && cp "$file" "$stage/.verified.json" || return 1
+  private_mode "$stage" 700 && private_mode "$stage/$arch" 600 && private_mode "$stage/$arch.manifest.json" 600 && private_mode "$stage/.verified.json" 600 || return 1
+  disk_guard || return 1
+  [[ ! -e "$target" && ! -L "$target" ]] || { error 'Каталог снимка появился во время скачивания.'; return 1; }
+  rm "$stage/.partial-owner" || return 1
+  mv "$stage" "$target" || return 1
+  ACTIVE_STAGE=''
+  log "Снимок $id скачан и проверен."
+}
+prepare_manifest() {
+  local name=$1 file
+  file="$WORK/manifests-data/$name"
+  local metadata_size
+  metadata_size=$(jq -r --arg p "$name" '[.[]|select(.Path==$p)][0].Size' "$WORK/list.json")
+  [[ "$metadata_size" =~ ^[0-9]+$ && "$metadata_size" -le 65536 ]] || { error 'Манифест слишком большой.'; return 1; }
+  rcall "$WORK/output" copyto "s3backup:$BUCKET/$REMOTE_PREFIX/$name" "$file" --max-transfer 64K --cutoff-mode hard || return 1
+  [[ $(wc -c < "$file" | tr -d '[:space:]') == "$metadata_size" ]] || { error 'Размер манифеста изменился во время скачивания.'; return 1; }
+  manifest_values "$file" || return 1
+  [[ "$name" == "$ARCHIVE.manifest.json" || "$name" == "$MID.manifest.json" ]] || { error 'Имя манифеста не соответствует снимку.'; return 1; }
+  [[ ! -e "$WORK/seen-$MID" ]] || { error 'Два манифеста для одного снимка: требуется проверка.'; return 1; }
+  : > "$WORK/seen-$MID"
+  jq -e --arg a "$ARCHIVE" --argjson n "$MSIZE" '[.[]|select(.Path==$a and .Size==$n)]|length==1' "$WORK/list.json" >/dev/null || { error 'Архив отсутствует или его размер отличается от манифеста.'; return 1; }
+  (( MTIME <= LATEST_REMOTE )) || LATEST_REMOTE=$MTIME
+  return 0
+}
+retain() {
+  local dir newest=0 newest_id='' cutoff count=0
+  : > "$WORK/retention"
+  for dir in ./snapshots/*; do
+    [[ -e "$dir" || -L "$dir" ]] || continue
+    disk_guard || return 1
+    local_verify "$dir" || { error 'Непроверенный файл в каталоге снимков: очистка отменена.'; return 1; }
+    printf '%s\t%s\n' "$MTIME" "$MID" >> "$WORK/retention"
+    (( MTIME <= newest )) || { newest=$MTIME; newest_id=$MID; }
+    count=$((count+1))
+  done
+  [[ "$count" -gt 0 ]] || { error 'Нет проверенных локальных снимков.'; return 1; }
+  cutoff=$(( $(now) - RETENTION * 86400 ))
+  (( newest >= cutoff )) || { error 'Последний снимок старше срока хранения. Очистка отменена.'; return 1; }
+  while IFS=$'\t' read -r epoch id; do
+    if (( epoch < cutoff )) && [[ "$id" != "$newest_id" ]]; then
+      disk_guard || return 1
+      dir="./snapshots/$id"
+      local_verify "$dir" || return 1
+      # Refuse additional files: retention owns exactly the verified pair and marker.
+      [[ $(find "$dir" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') == 3 ]] || { error 'В снимке есть посторонние файлы; очистка отменена.'; return 1; }
+      rm -- "$dir/$ARCHIVE" "$dir/$ARCHIVE.manifest.json" "$dir/.verified.json" && rmdir "$dir" || return 1
+      log "Истёк срок хранения снимка $id; локальная копия удалена."
+    fi
+  done < "$WORK/retention"
+  jq -n --arg id "$newest_id" --argjson at "$newest" '{snapshotId:$id,snapshotAt:$at}' > "$STATE/latest.json.tmp" && mv -f "$STATE/latest.json.tmp" "$STATE/latest.json"
+}
+local_date() {
+  local tz=$1 epoch=$2 format=$3
+  TZ="$tz" date -d "@$epoch" "$format" 2>/dev/null || TZ="$tz" date -r "$epoch" "$format"
+}
+due() {
+  local time tz days current today previous last=0 oldday
+  [[ -f "$STATE/enabled" ]] || return 1
+  time=$(jq -r .time "$CONFIG"); tz=$(jq -r .timezone "$CONFIG"); days=$(jq -r .interval_days "$CONFIG")
+  current=$(local_date "$tz" "$(now)" +%H:%M) || return 1
+  [[ "$current" < "$time" ]] && return 1
+  today=$(local_date "$tz" "$(now)" +%Y-%m-%d) || return 1
+  if [[ -f "$STATE/last-attempt.json" ]]; then
+    last=$(jq -er '.at|select(type=="number")' "$STATE/last-attempt.json") || return 1
+    oldday=$(local_date "$tz" "$last" +%Y-%m-%d) || return 1
+    [[ "$oldday" != "$today" ]] || return 1
+    # Calendar dates, not 24h since actual late start, keep a daily 05:00 schedule.
+    previous=$(jq -nr --arg day "$oldday" '$day+"T00:00:00Z"|fromdateiso8601') || return 1
+    current=$(jq -nr --arg day "$today" '$day+"T00:00:00Z"|fromdateiso8601') || return 1
+    (( (current - previous) / 86400 >= days )) || return 1
+  fi
+}
+run_worker() {
+  local mode=$1 name rc=0 token
+  if ! lock_run; then
+    [[ "$mode" == tick ]] && return 0
+    error 'Копирование или настройка уже выполняется.'; return 1
+  fi
+  load_config || return 1
+  # Registration and Stop use the same lock: Stop cannot miss a worker which
+  # already decided that its schedule is enabled but has not published a PID.
+  lock_control || return 1
+  if [[ "$mode" == tick ]]; then due || return 0; fi
+  WORK=$(mktemp -d "$RUN/work.XXXXXX") || return 1
+  WORKER=1
+  token=$(process_token $$ 2>/dev/null || :)
+  jq -n --argjson pid $$ --arg token "$token" '{pid:$pid,token:$token}' > "$RUN/process.json.tmp" && mv -f "$RUN/process.json.tmp" "$RUN/process.json" || return 1
+  trap cleanup EXIT
+  trap cancelled INT TERM HUP
+  flock -u 8; exec 8>&-
+  if [[ "$mode" != check ]]; then
+    jq -n --argjson at "$(now)" '{at:$at}' > "$STATE/last-attempt.json.tmp" && mv -f "$STATE/last-attempt.json.tmp" "$STATE/last-attempt.json" || return 1
+    json_state running
+  fi
+  log 'Начата проверка S3.'
+  if ! disk_guard; then json_state failed; return 1; fi
+  cd "$BACKUP" || { json_state failed; return 1; }
+  HELD_DISK=1
+  if ! disk_guard || ! origin_guard; then json_state failed; return 1; fi
+  if ! list_s3; then json_state failed; return 1; fi
+  if [[ ! -s "$WORK/manifests" ]]; then
+    if [[ "$mode" != check ]]; then json_state skipped; fi
+    log 'S3 доступно, манифестов нет. Загрузка и очистка пропущены; локальная история сохранена.'
+    return 0
+  fi
+  if [[ "$mode" == check ]]; then log 'Доступ к S3 и список манифестов проверены. Архивы не скачивались.'; return 0; fi
+  disk_guard && mkdir -p ./snapshots ./.staging "$WORK/manifests-data" || { json_state failed; return 1; }
+  cleanup_partials || { json_state failed; return 1; }
+  LATEST_REMOTE=0
+  while IFS= read -r name; do
+    if ! prepare_manifest "$name"; then rc=1; break; fi
+  done < "$WORK/manifests"
+  if [[ "$rc" != 0 ]]; then json_state failed; return 1; fi
+  while IFS= read -r name; do
+    if ! fetch_snapshot "$name"; then rc=1; break; fi
+  done < "$WORK/manifests"
+  if [[ "$rc" == 0 ]]; then retain || rc=1; fi
+  if [[ "$rc" == 0 ]]; then json_state success; log 'Копирование завершено. Все принятые архивы проверены.'
+  else json_state failed; log 'Копирование завершилось ошибкой. Проверьте журнал.'; fi
+  return "$rc"
+}
+ask() {
+  local label=$1 default=$2 value
+  printf '%s [%s]: ' "$label" "$default" >/dev/tty
+  IFS= read -r value </dev/tty || return 1
+  REPLY=${value:-$default}
+}
+yes() {
+  local answer
+  printf '%s [да/НЕТ]: ' "$1" >/dev/tty
+  IFS= read -r answer </dev/tty || return 1
+  [[ "$answer" == да || "$answer" == yes || "$answer" == y ]]
+}
+secret() {
+  printf '%s: ' "$1" >/dev/tty
+  IFS= read -r -s REPLY </dev/tty || { printf '\n' >/dev/tty; return 1; }
+  printf '\n' >/dev/tty
+  [[ -n "$REPLY" && "$REPLY" != *$'\r'* && "$REPLY" != *$'\n'* && "$REPLY" != ' '* && "$REPLY" != *' ' ]]
+}
+cfg_default() { if [[ -f "$CONFIG" ]]; then jq -r --arg k "$1" --arg d "$2" 'if has($k) and .[$k]!=null then .[$k] else $d end' "$CONFIG"; else printf '%s\n' "$2"; fi; }
+configure() {
+  local endpoint region bucket prefix style dir time tz days retention bw rec src point uuid access='' secret_key='' change=0 new config_before rconf_before relative_dir
+  lock_control && lock_run || { error 'Остановите текущую загрузку перед настройкой.'; return 1; }
+  printf 'Мастер s3backup. Enter сохраняет текущее значение. Архивы могут содержать секреты; каталог не должен быть общим SMB/FTP/DLNA ресурсом.\n'
+  ask 'Адрес S3 (HTTPS)' "$(cfg_default endpoint '')" || return 1; endpoint=$REPLY
+  ask 'Регион' "$(cfg_default region us-east-1)" || return 1; region=$REPLY
+  ask 'Бакет' "$(cfg_default bucket '')" || return 1; bucket=$REPLY
+  ask 'Папка в бакете' "$(cfg_default prefix backups)" || return 1; prefix=$REPLY
+  ask 'Адресация path-style (true/false)' "$(cfg_default path_style true)" || return 1; style=$REPLY
+  if [[ ! -f "$RCONF" ]] || yes 'Заменить ключи S3?'; then
+    secret 'Access Key (ввод скрыт)' || { error 'Пустой или некорректный ключ.'; return 1; }; access=$REPLY
+    secret 'Secret Key (ввод скрыт)' || { error 'Пустой или некорректный секрет.'; return 1; }; secret_key=$REPLY; change=1
+  fi
+  printf 'Подключённые файловые системы:\n'; awk '$3 !~ /tmpfs|proc|sysfs|devpts|squashfs|overlay/ {print "  " $2 " (" $3 ")"}' "$MOUNTS"
+  ask 'Полный путь нового закрытого каталога на HDD' "$(cfg_default backup_dir '')" || return 1; dir=${REPLY%/}
+  safe_path "$dir" && no_links "$dir" || { error 'Некорректный путь.'; return 1; }
+  rec=$(mount_record "$dir") || return 1
+  # shellcheck disable=SC2034
+  IFS=$'\t' read -r src point unused_fs <<< "$rec"
+  uuid=$(blkid -s UUID -o value "$src" 2>/dev/null) || { error 'У диска не найден UUID.'; return 1; }
+  ask 'Время ежедневной проверки HH:MM' "$(cfg_default time 05:00)" || return 1; time=$REPLY
+  ask 'Часовой пояс POSIX (UTC0; MSK-3 = UTC+3)' "$(cfg_default timezone UTC0)" || return 1; tz=$REPLY
+  ask 'Интервал в днях (1 = каждый день)' "$(cfg_default interval_days 1)" || return 1; days=$REPLY
+  ask 'Хранить снимки, дней' "$(cfg_default retention_days 30)" || return 1; retention=$REPLY
+  ask 'Ограничение скорости МиБ/с (0 = без ограничения)' "$(cfg_default bandwidth_mib 0)" || return 1; bw=$REPLY
+  [[ "$style" == true || "$style" == false ]] && [[ "$days" =~ ^[0-9]+$ && "$retention" =~ ^[0-9]+$ && "$bw" =~ ^[0-9]+$ ]] || { error 'Некорректные числовые значения.'; return 1; }
+  new=$(mktemp -d "$ETC/.configure.XXXXXX") || return 1
+  jq -n --arg endpoint "$endpoint" --arg region "$region" --arg bucket "$bucket" --arg prefix "$prefix" --argjson style "$style" --arg dir "$dir" --arg point "$point" --arg uuid "$uuid" --arg time "$time" --arg tz "$tz" --argjson days "$days" --argjson retention "$retention" --argjson bw "$bw" '{version:1,endpoint:$endpoint,region:$region,bucket:$bucket,prefix:$prefix,path_style:$style,backup_dir:$dir,mount_point:$point,mount_uuid:$uuid,time:$time,timezone:$tz,interval_days:$days,retention_days:$retention,bandwidth_mib:$bw,reserve_mib:64}' > "$new/config.json" || return 1
+  if [[ "$change" == 0 ]]; then
+    # Only copy the credential fields; changed endpoint/bucket parameters must take effect.
+    access=$(sed -n 's/^access_key_id = //p' "$RCONF")
+    secret_key=$(sed -n 's/^secret_access_key = //p' "$RCONF")
+  fi
+  [[ -n "$access" && -n "$secret_key" ]] || { error 'Ключи не найдены; повторите мастер с заменой ключей.'; rm -rf "$new"; return 1; }
+  { printf '[s3backup]\ntype = s3\nprovider = Other\nenv_auth = false\n'; printf 'endpoint = %s\nregion = %s\nforce_path_style = %s\n' "$endpoint" "$region" "$style"; printf 'access_key_id = %s\nsecret_access_key = %s\n' "$access" "$secret_key"; } > "$new/rclone.conf"
+  unset access secret_key REPLY
+  config_before=$CONFIG; rconf_before=$RCONF; CONFIG="$new/config.json"; RCONF="$new/rclone.conf"
+  if ! load_config || ! disk_identity; then CONFIG=$config_before; RCONF=$rconf_before; rm -rf "$new"; return 1; fi
+  CONFIG=$config_before; RCONF=$rconf_before
+  if [[ -f "$CONFIG" ]] && [[ $(jq -r .backup_dir "$CONFIG") == "$dir" ]] && [[ $(jq -cS '{endpoint,bucket,prefix}' "$CONFIG") != "$(jq -cS '{endpoint,bucket,prefix}' "$new/config.json")" ]]; then
+    error 'При смене S3-хранилища выберите новый каталог на HDD. Прежние копии сохраняются.'; rm -rf "$new"; return 1
+  fi
+  printf '\nS3: %s / %s\nHDD: %s\nРасписание: %s (%s), каждые %s дн.\nХранение: %s дн.; последняя исправная копия сохраняется.\n' "$bucket" "$prefix" "$dir" "$time" "$tz" "$days" "$retention"
+  if ! yes 'Сохранить настройки?'; then rm -rf "$new"; printf 'Настройки не изменены.\n'; return 0; fi
+  # The operator can unplug the HDD while answering questions. Hold its mount
+  # before creating directories so an unplug never creates them on the router.
+  disk_identity && cd "$point" && disk_identity || { rm -rf "$new"; return 1; }
+  relative_dir="./${dir#"$point/"}"
+  if [[ -e "$relative_dir" || -L "$relative_dir" ]]; then
+    [[ -d "$relative_dir" && ! -L "$relative_dir" ]] || { error 'Выбранный путь не является обычным каталогом.'; rm -rf "$new"; return 1; }
+    if [[ -f "$relative_dir/.tkbackup-owner" && ! -L "$relative_dir/.tkbackup-owner" && $(cat "$relative_dir/.tkbackup-owner") == tkbackup-v1 ]]; then
+      private_mode "$relative_dir" 700 || return 1
+    else
+      directory_empty "$relative_dir" || { error 'Каталог не пуст или его содержимое нельзя проверить.'; rm -rf "$new"; return 1; }
+      private_mode "$relative_dir" 700 || return 1
+      directory_empty "$relative_dir" || { error 'В каталоге появились чужие файлы или он недоступен; настройка отменена.'; rm -rf "$new"; return 1; }
+      printf 'tkbackup-v1\n' > "$relative_dir/.tkbackup-owner" || return 1
+    fi
+  else
+    mkdir -p "$relative_dir" || return 1
+    printf 'tkbackup-v1\n' > "$relative_dir/.tkbackup-owner" || return 1
+  fi
+  private_mode "$relative_dir" 700 || return 1
+  [[ ! -f "$CONFIG" ]] || cp "$CONFIG" "$ETC/config.previous.json"
+  [[ ! -f "$RCONF" ]] || cp "$RCONF" "$ETC/rclone.previous.conf"
+  mv "$new/rclone.conf" "$RCONF" && mv "$new/config.json" "$CONFIG" || return 1
+  rmdir "$new"
+  log 'Настройки сохранены. Изменения действуют со следующего запуска.'
+}
+stop_service() {
+  local pid token i
+  lock_control || return 1
+  if [[ "${1:-stop}" != shutdown ]]; then rm -f "$STATE/enabled"; fi
+  if [[ -f "$RUN/process.json" && ! -L "$RUN/process.json" ]]; then
+    pid=$(jq -er '.pid|select(type=="number" and .>1)' "$RUN/process.json" 2>/dev/null || :)
+    token=$(jq -er '.token|select(type=="string")' "$RUN/process.json" 2>/dev/null || :)
+    if [[ -n "$pid" ]] && same_process "$pid" "$token"; then
+      kill -TERM "$pid" || return 1
+      for ((i=0;i<20;i++)); do same_process "$pid" "$token" || break; sleep 1; done
+      if same_process "$pid" "$token"; then error 'Автозапуск выключен, но процесс ещё завершает работу. Повторите status.'; return 1; fi
+    elif [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      error 'Автозапуск выключен. Личность процесса не подтверждена; сигнал не отправлен.'; return 1
+    fi
+  fi
+  if [[ "${1:-stop}" == shutdown ]]; then log 'Текущая загрузка остановлена перед выключением; настройка автозапуска сохранена.'
+  else log 'Служба остановлена. Общий cron и архивы не изменены.'; fi
+}
+start_service() {
+  lock_control && lock_run || { error 'Подождите завершения другой операции.'; return 1; }
+  load_config && disk_guard || return 1
+  [[ -f "$PREFIX/etc/cron.d/s3backup" ]] || { error 'Нет задания cron; повторите install.sh.'; return 1; }
+  [[ -x "$PREFIX/etc/init.d/S10cron" ]] && "$PREFIX/etc/init.d/S10cron" start || { error 'Не удалось запустить общий cron.'; return 1; }
+  : > "$STATE/enabled"
+  log 'Служба включена. Копирование начнётся по расписанию; run запускает его сразу.'
+}
+status() {
+  local pid token at result id age tz=UTC0
+  printf 's3backup %s\n' "$VERSION"
+  if [[ -f "$STATE/enabled" ]]; then printf 'Расписание: включено\n'; else printf 'Расписание: выключено\n'; fi
+  if [[ -f "$CONFIG" ]]; then jq -r '"Время: \(.time) (\(.timezone)), каждые \(.interval_days) дн.\nХранение: \(.retention_days) дн.\nКаталог: \(.backup_dir)"' "$CONFIG"; fi
+  if [[ -f "$RUN/process.json" ]]; then
+    pid=$(jq -r .pid "$RUN/process.json"); token=$(jq -r .token "$RUN/process.json")
+    if same_process "$pid" "$token"; then printf 'Загрузка: выполняется\n'; else printf 'Загрузка: активный процесс не подтверждён\n'; fi
+  else printf 'Загрузка: не выполняется\n'; fi
+  if [[ -f "$CONFIG" ]]; then tz=$(jq -r .timezone "$CONFIG"); fi
+  printf 'Общий cron: состояние не проверено (start запускает S10cron).\n'
+  if [[ -f "$STATE/last-attempt.json" ]]; then
+    at=$(jq -r .at "$STATE/last-attempt.json")
+    printf 'Последняя попытка: %s (%s)\n' "$(local_date "$tz" "$at" '+%d.%m.%Y %H:%M:%S')" "$tz"
+  fi
+  if [[ -f "$STATE/result.json" ]]; then
+    result=$(jq -r .result "$STATE/result.json")
+    case "$result" in success) result='успешно';; skipped) result='пропущено: в S3 нет манифестов, локальная история сохранена';; failed) result='ошибка';; cancelled) result='отменено';; running) result='выполняется (при отсутствии процесса запуск прерван)';; esac
+    printf 'Результат: %s\n' "$result"
+  fi
+  if [[ -f "$STATE/latest.json" ]]; then
+    at=$(jq -r .snapshotAt "$STATE/latest.json"); id=$(jq -r .snapshotId "$STATE/latest.json")
+    age=$(( ($(now) - at) / 3600 ))
+    printf 'Последний проверенный снимок: %s\nДата снимка: %s (%s), возраст %s ч.\n' "$id" "$(local_date "$tz" "$at" '+%d.%m.%Y %H:%M:%S')" "$tz" "$age"
+  else printf 'Проверенных локальных снимков пока не зарегистрировано.\n'; fi
+}
+uninstall() {
+  yes 'Удалить программу и её cron/init? Конфигурация и архивы сохранятся.' || return 0
+  stop_service || return 1
+  # stop_service holds control lock in this process; acquiring run lock waits for no one.
+  lock_run || { error 'Процесс ещё выполняется; удаление отменено.'; return 1; }
+  rm -f "$PREFIX/etc/cron.d/s3backup" "$PREFIX/etc/init.d/S98s3backup" "$PREFIX/bin/s3backup"
+  printf 'Утилита удалена. Конфигурация, журналы и архивы сохранены.\n'
+}
+menu() {
+  local option
+  while :; do
+    printf '\nS3Backup — локальные резервные копии\n1. Настроить S3, HDD, расписание и хранение\n2. Проверить доступ к S3\n3. Включить службу\n4. Остановить службу и текущую загрузку\n5. Скопировать сейчас\n6. Состояние\n7. Журнал\n8. Перезапустить службу\n9. Удалить утилиту (сохранить архивы)\n0. Выход\nВыбор: '
+    IFS= read -r option || return 0
+    # Each command has its own lock lifetime and traps; never retain locks in the menu.
+    case "$option" in
+      1) bash "$0" configure;; 2) bash "$0" check;; 3) bash "$0" start;; 4) bash "$0" stop;;
+      5) bash "$0" run;; 6) bash "$0" status;; 7) bash "$0" logs;; 8) bash "$0" restart;;
+      9) bash "$0" uninstall; [[ -f "$0" ]] || return 0;; 0) return 0;; *) printf 'Выберите пункт меню.\n';;
+    esac
+  done
+}
+help_text() {
+  printf 's3backup %s\nБез аргументов — интерактивное меню.\nconfigure  Мастер параметров S3, диска, расписания и хранения\ncheck      Проверить доступ к S3 (без скачивания архивов)\nstart      Включить задания по расписанию\nstop       Выключить расписание и остановить текущую загрузку\nrestart    Остановить, затем включить расписание\nrun        Скопировать сейчас (в переднем плане)\nstatus     Состояние и последняя копия\nlogs       Последние записи журнала\nuninstall  Удалить утилиту; сохранить настройки и архивы\ntick       Внутренняя команда cron, S3 только при наступлении срока\n' "$VERSION"
+}
+case "${1:-menu}" in help|--help|-h) help_text; exit 0;; version|--version|-v) printf '%s\n' "$VERSION"; exit 0;; esac
+for dep in jq flock rclone sha256sum blkid stat; do need "$dep" || exit 1; done
+init_dirs || exit 1
+case "${1:-menu}" in
+  menu) menu;; configure|config|install) configure;; run|tick|check) run_worker "$1";;
+  start|-start) start_service;; stop|-stop) stop_service;;
+  shutdown) stop_service shutdown;;
+  restart|-restart) bash "$0" stop && bash "$0" start;;
+  status|-status) status;; logs) if [[ -f "$STATE/activity.log" ]]; then tail -n 50 "$STATE/activity.log"; else printf 'Журнал пока пуст.\n'; fi;;
+  uninstall|remove) uninstall;; *) help_text; exit 2;;
+esac

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Enabled state is persistent; boot does not undo the user's Stop command.
+S3_PREFIX='@PREFIX@'
+export S3BACKUP_PREFIX="$S3_PREFIX"
+case "${1:-start}" in
+  start) exit 0;;
+  stop) "$S3_PREFIX/bin/s3backup" shutdown;;
+  restart) "$S3_PREFIX/bin/s3backup" restart;;
+  status) "$S3_PREFIX/bin/s3backup" status;;
+  *) echo 'Usage: S98s3backup {start|stop|restart|status}' >&2; exit 2;;
+esac
