@@ -5,7 +5,7 @@
 set -u
 set -o pipefail
 umask 077
-VERSION=1.1.0
+VERSION=1.1.1
 PREFIX=${S3BACKUP_PREFIX:-/opt}
 PATH="$PREFIX/bin:$PREFIX/sbin:$PATH"
 export PATH
@@ -17,6 +17,7 @@ RCONF="$ETC/rclone.conf"
 MOUNTS=${S3BACKUP_MOUNTS_FILE:-/proc/mounts}
 PROC=${S3BACKUP_PROC_ROOT:-/proc}
 CHILD='' CHILD_TOKEN='' WORK='' WORKER=0 ACTIVE_STAGE='' HELD_DISK=0
+SHOW_PROGRESS=0
 
 error() { printf 'Ошибка: %s\n' "$*" >&2; return 1; }
 need() { command -v "$1" >/dev/null 2>&1 || error "Не установлена программа $1. Запустите install.sh."; }
@@ -53,6 +54,9 @@ log() {
   printf '%s\n' "$line" >> "$STATE/activity.log"
   printf '%s\n' "$line"
   if command -v logger >/dev/null 2>&1; then logger -t s3backup -- "$*" 2>/dev/null || :; fi
+}
+progress() {
+  if (( SHOW_PROGRESS )); then printf '%s\n' "$*" >&2; fi
 }
 json_state() {
   local outcome=$1
@@ -205,13 +209,27 @@ cleanup() {
 }
 cancelled() { log 'Копирование остановлено; готовые копии сохранены.'; json_state cancelled; exit 130; }
 rcall() {
-  local output=$1 rc
-  shift
+  local output=$1 waiting=$2 rc started next_report elapsed
+  shift 2
   local args=(--config "$RCONF" --transfers 1 --checkers 1 --buffer-size 1M --multi-thread-streams 0 --retries 2 --low-level-retries 2 --contimeout 20s --timeout 2m --log-level ERROR)
   [[ "$BANDWIDTH" == 0 ]] || args+=(--bwlimit "${BANDWIDTH}M")
   rclone "${args[@]}" "$@" > "$output" 2> "$WORK/rclone-error" &
   CHILD=$!
   CHILD_TOKEN=$(process_token "$CHILD" 2>/dev/null || :)
+  # Report only our own messages. Raw rclone output can contain credentials.
+  # Poll the same child in the foreground so cancellation needs no extra worker.
+  if (( SHOW_PROGRESS )) && [[ -n "$waiting" && -n "$CHILD_TOKEN" ]]; then
+    started=$SECONDS
+    next_report=5
+    while same_process "$CHILD" "$CHILD_TOKEN"; do
+      elapsed=$((SECONDS - started))
+      if (( elapsed >= next_report )); then
+        progress "$waiting (прошло ${elapsed} с)."
+        next_report=$((elapsed + 5))
+      fi
+      sleep 1
+    done
+  fi
   wait "$CHILD"; rc=$?
   CHILD='' CHILD_TOKEN=''
   [[ "$rc" == 0 ]] || { log "S3: операция не выполнена (код $rc). Проверьте сеть, ключ и параметры хранилища."; return "$rc"; }
@@ -259,7 +277,8 @@ local_verify() {
 }
 list_s3() {
   local name manifest_pattern LC_ALL=C
-  rcall "$WORK/list.json" lsjson "s3backup:$BUCKET/$REMOTE_PREFIX" --recursive --files-only || return 1
+  progress 'Получаю список объектов S3.'
+  rcall "$WORK/list.json" 'Ожидаю список объектов S3' lsjson "s3backup:$BUCKET/$REMOTE_PREFIX" --recursive --files-only || return 1
   jq -e 'type=="array" and all(.[]; (.Path|type=="string") and (.Size|type=="number" and .>=0))' "$WORK/list.json" >/dev/null 2>&1 || { error 'S3 вернул некорректный список.'; return 1; }
   # Exclude control characters before line-based iteration: a newline embedded
   # in one object key must never become a second, apparently valid object name.
@@ -274,26 +293,32 @@ list_s3() {
   return 0
 }
 fetch_snapshot() {
-  local name=$1 file target stage free expected key sha epoch id arch
+  local name=$1 position=$2 file target stage free expected key sha epoch id arch
   file="$WORK/manifests-data/$name"
   manifest_values "$file" || return 1
   id=$MID key=$KEY sha=$MSHA epoch=$MTIME arch=$ARCHIVE expected=$MSIZE
   target="./snapshots/$id"
   disk_guard || return 1
   if [[ -e "$target" || -L "$target" ]]; then
+    progress "$position. Проверяю локальную копию $id."
     local_verify "$target" || { error "Локальная копия $id повреждена; перезапись запрещена."; return 1; }
     [[ "$KEY" == "$key" && "$MSHA" == "$sha" && "$MSIZE" == "$expected" && "$MTIME" == "$epoch" ]] || { error "Снимок $id в облаке изменился; локальная копия сохранена."; return 1; }
     return 0
   fi
   # Expired source objects must not be downloaded and deleted again every day.
   # Always retain the newest available snapshot even if the source stopped.
-  if (( epoch < $(now) - RETENTION * 86400 && epoch < LATEST_REMOTE )); then return 0; fi
+  if (( epoch < $(now) - RETENTION * 86400 && epoch < LATEST_REMOTE )); then
+    progress "$position. Пропускаю снимок $id по сроку хранения."
+    return 0
+  fi
   free=$(df -Pk . | awk 'END{print $4}')
   [[ "$free" =~ ^[0-9]+$ ]] && (( free * 1024 > expected + RESERVE * 1048576 )) || { error 'Недостаточно свободного места на HDD.'; return 1; }
   stage=$(mktemp -d "./.staging/$id.XXXXXX") || return 1
   ACTIVE_STAGE=$stage
   printf 'tkbackup-v1\n' > "$stage/.partial-owner" || return 1
-  rcall "$WORK/output" copyto "s3backup:$BUCKET/$key" "$stage/$arch" || return 1
+  progress "$position. Скачиваю снимок $id."
+  rcall "$WORK/output" "Ожидаю завершения загрузки снимка $id" copyto "s3backup:$BUCKET/$key" "$stage/$arch" || return 1
+  progress "$position. Проверяю размер и SHA-256."
   verify_file "$stage/$arch" || return 1
   cp "$file" "$stage/$arch.manifest.json" && cp "$file" "$stage/.verified.json" || return 1
   private_mode "$stage" 700 && private_mode "$stage/$arch" 600 && private_mode "$stage/$arch.manifest.json" 600 && private_mode "$stage/.verified.json" 600 || return 1
@@ -310,7 +335,7 @@ prepare_manifest() {
   local metadata_size
   metadata_size=$(jq -r --arg p "$name" '[.[]|select(.Path==$p)][0].Size' "$WORK/list.json")
   [[ "$metadata_size" =~ ^[0-9]+$ && "$metadata_size" -le 65536 ]] || { error 'Манифест слишком большой.'; return 1; }
-  rcall "$WORK/output" copyto "s3backup:$BUCKET/$REMOTE_PREFIX/$name" "$file" --max-transfer 64K --cutoff-mode hard || return 1
+  rcall "$WORK/output" '' copyto "s3backup:$BUCKET/$REMOTE_PREFIX/$name" "$file" --max-transfer 64K --cutoff-mode hard || return 1
   [[ $(wc -c < "$file" | tr -d '[:space:]') == "$metadata_size" ]] || { error 'Размер манифеста изменился во время скачивания.'; return 1; }
   manifest_values "$file" || return 1
   [[ "$name" == "$ARCHIVE.manifest.json" || "$name" == "$MID.manifest.json" ]] || { error 'Имя манифеста не соответствует снимку.'; return 1; }
@@ -369,7 +394,8 @@ due() {
   fi
 }
 run_worker() {
-  local mode=$1 name rc=0 token
+  local mode=$1 name rc=0 token index=0 total
+  if [[ "$mode" == run ]]; then SHOW_PROGRESS=1; fi
   if ! lock_run; then
     [[ "$mode" == tick ]] && return 0
     error 'Копирование или настройка уже выполняется.'; return 1
@@ -405,14 +431,23 @@ run_worker() {
   disk_guard && mkdir -p ./snapshots ./.staging "$WORK/manifests-data" || { json_state failed; return 1; }
   cleanup_partials || { json_state failed; return 1; }
   LATEST_REMOTE=0
+  total=$(wc -l < "$WORK/manifests")
+  total=$((total))
   while IFS= read -r name; do
+    index=$((index + 1))
+    progress "Манифест $index/$total. Скачиваю и проверяю."
     if ! prepare_manifest "$name"; then rc=1; break; fi
   done < "$WORK/manifests"
   if [[ "$rc" != 0 ]]; then json_state failed; return 1; fi
+  index=0
   while IFS= read -r name; do
-    if ! fetch_snapshot "$name"; then rc=1; break; fi
+    index=$((index + 1))
+    if ! fetch_snapshot "$name" "Снимок $index/$total"; then rc=1; break; fi
   done < "$WORK/manifests"
-  if [[ "$rc" == 0 ]]; then retain || rc=1; fi
+  if [[ "$rc" == 0 ]]; then
+    progress 'Проверяю локальные снимки и срок хранения.'
+    retain || rc=1
+  fi
   if [[ "$rc" == 0 ]]; then json_state success; log 'Копирование завершено. Все принятые архивы проверены.'
   else json_state failed; log 'Копирование завершилось ошибкой. Проверьте журнал.'; fi
   return "$rc"

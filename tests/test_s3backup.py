@@ -212,6 +212,25 @@ class BackupAcceptance(unittest.TestCase):
         self.remote.joinpath(filename + ".manifest.json").unlink()
         return local
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "transfer heartbeat uses Linux process identity")
+    def test_manual_run_reports_progress_before_slow_download_finishes(self):
+        worker, _ = self.start_slow_worker()
+        waiting = "Ожидаю завершения загрузки снимка snapshot-01".encode()
+        output = b""
+        deadline = time.monotonic() + 10
+        while waiting not in output:
+            remaining = deadline - time.monotonic()
+            self.assertGreater(remaining, 0, output.decode(errors="replace"))
+            ready, _, _ = select.select([worker.stderr], [], [], remaining)
+            self.assertTrue(ready, "no progress during archive download")
+            chunk = os.read(worker.stderr.fileno(), 4096)
+            self.assertTrue(chunk, "worker exited before reporting progress")
+            output += chunk
+        self.assertIn("Манифест 1/1".encode(), output)
+        self.assertIn("Снимок 1/1. Скачиваю снимок snapshot-01.".encode(), output)
+        self.assertIsNone(worker.poll())
+        self.assertFalse((self.backups / "snapshots" / "snapshot-01").exists())
+
     def test_accepts_pair_and_rechecks_without_archive_redownload(self):
         manifest, payload = self.snapshot()
         self.invoke("run", ok=True)
