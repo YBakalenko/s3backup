@@ -14,7 +14,7 @@
 
 ```sh
 s3backup_setup=$(mktemp -d) &&
-  curl -fsSL https://raw.githubusercontent.com/YBakalenko/s3backup/main/install.sh \
+  curl -fsSL https://raw.githubusercontent.com/YBakalenko/s3backup/refs/heads/main/install.sh \
     -o "$s3backup_setup/install.sh" &&
   sh "$s3backup_setup/install.sh" --download
 ```
